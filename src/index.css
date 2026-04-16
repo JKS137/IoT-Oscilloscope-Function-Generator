@@ -1,0 +1,31 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-zinc-950 text-zinc-100 font-sans antialiased;
+  }
+}
+
+.oscilloscope-grid .recharts-cartesian-grid-horizontal line,
+.oscilloscope-grid .recharts-cartesian-grid-vertical line {
+  stroke: rgba(255, 255, 255, 0.1);
+}
+
+.oscilloscope-grid .recharts-cartesian-axis-line {
+  stroke: rgba(255, 255, 255, 0.3);
+}
+
+.oscilloscope-grid .recharts-cartesian-axis-tick-line {
+  stroke: rgba(255, 255, 255, 0.3);
+}
+
+.oscilloscope-grid .recharts-text {
+  @apply fill-zinc-500 font-mono text-[10px];
+}
+

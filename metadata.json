@@ -1,0 +1,6 @@
+{
+  "name": "IoT Oscilloscope & Function Generator",
+  "description": "A remote-access dashboard for real-time signal acquisition and waveform generation, simulating an IoT-connected oscilloscope.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
