@@ -9,7 +9,8 @@
         "email": { "type": "string" },
         "displayName": { "type": "string" },
         "role": { "type": "string", "enum": ["user", "admin"] },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "savedSettings": { "type": "object" }
       },
       "required": ["uid", "email"]
     },

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Activity, 
@@ -31,7 +31,9 @@ import {
   YAxis, 
   CartesianGrid, 
   ResponsiveContainer, 
-  ReferenceLine 
+  ReferenceLine,
+  ReferenceArea,
+  Tooltip
 } from 'recharts';
 import { motion, AnimatePresence } from 'motion/react';
 import socket from './lib/socket';
@@ -62,7 +64,16 @@ export default function App() {
   const [isLive, setIsLive] = useState(true);
   const [alerts, setAlerts] = useState<{ id: string, msg: string, time: string }[]>([]);
   const [aiReport, setAiReport] = useState<string | null>(null);
+  const [aiFindings, setAiFindings] = useState<{ xStart: number, xEnd: number, label: string, details: string, color: string }[]>([]);
   const [isSaving, setIsSaving] = useState(false);
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+  
+  // Zoom & Pan State
+  const [viewDomainX, setViewDomainX] = useState<[number, number] | null>(null);
+  const [viewDomainY, setViewDomainY] = useState<[number, number] | null>(null);
+  const chartRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+  const lastMousePos = useRef<{ x: number, y: number } | null>(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (u) => {
@@ -125,11 +136,15 @@ export default function App() {
   const performAiAnalysis = async () => {
     setIsAiAnalyzing(true);
     setAiReport(null);
+    setAiFindings([]);
+    // Pause live feed to visualize static findings
+    setIsLive(false);
+
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      // Sampling some points for context
+      // Sampling points for context
       const samplePoints = points.filter((_, i) => i % 5 === 0);
-      const dataStr = samplePoints.map(p => `t:${p.t}, v:${p.v}`).join('\n');
+      const dataStr = samplePoints.map(p => `t:${p.t.toFixed(4)}, v:${p.v.toFixed(3)}`).join('\n');
       
       const prompt = `
         You are an expert electronics engineer and signal analyst.
@@ -139,19 +154,43 @@ export default function App() {
         Signal Data (subset):
         ${dataStr}
         
-        Provide a concise analysis:
-        1. Does the waveform match the expected ${settings.type} pattern?
-        2. Identify any visible noise or clipping.
-        3. Suggest what this signal could represent in a real-world scenario (e.g., sensor data, power line, etc.).
-        4. Check for anomalies.
+        Provide a detailed report and identify specific regions of interest (e.g., clipping, noise, transients, dc-offset issues).
+        If a region is identified, pinpoint the start and end 't' values.
+        For each finding, provide a meaningful 'label' and a detailed technical explanation under 'details'.
       `;
 
       const response = await ai.models.generateContent({
         model: "gemini-3.1-flash-lite-preview",
         contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              analysisText: { type: Type.STRING, description: "The descriptive analysis of the signal." },
+              findings: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    xStart: { type: Type.NUMBER, description: "Start time 't' value" },
+                    xEnd: { type: Type.NUMBER, description: "End time 't' value" },
+                    label: { type: Type.STRING, description: "Brief label for the finding (e.g., 'Clipping')" },
+                    details: { type: Type.STRING, description: "Deep technical detail about why this was flagged." },
+                    color: { type: Type.STRING, description: "CSS color hex for highlight (e.g., '#ff4444' for clipping, '#ffbb33' for noise)" }
+                  },
+                  required: ["xStart", "xEnd", "label", "details", "color"]
+                }
+              }
+            },
+            required: ["analysisText", "findings"]
+          }
+        }
       });
 
-      setAiReport(response.text || "No analysis generated.");
+      const result = JSON.parse(response.text);
+      setAiReport(result.analysisText);
+      setAiFindings(result.findings || []);
     } catch (error) {
       console.error("AI Analysis failed:", error);
       setAiReport("Failed to analyze signal. Check console for details.");
@@ -160,6 +199,32 @@ export default function App() {
     }
   };
   
+  const saveSettings = async () => {
+    if (!user) {
+      alert("Please login to save settings");
+      return;
+    }
+    setIsSavingSettings(true);
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      await setDoc(userRef, {
+        savedSettings: settings,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+
+      const newAlert = {
+        id: Math.random().toString(36).substr(2, 9),
+        msg: "Generator settings saved to profile!",
+        time: new Date().toLocaleTimeString()
+      };
+      setAlerts(prev => [newAlert, ...prev]);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
+    } finally {
+      setIsSavingSettings(false);
+    }
+  };
+
   const pointsRef = useRef<SignalPoint[]>([]);
   const maxPoints = 300; // Limit for performance
 
@@ -215,340 +280,452 @@ export default function App() {
   };
 
   // Calculate stats
+  const resetView = () => {
+    setViewDomainX(null);
+    setViewDomainY(null);
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    if (!points.length) return;
+
+    const zoomStep = 0.1;
+    const direction = e.deltaY > 0 ? 1 : -1;
+    const factor = 1 + direction * zoomStep;
+
+    // Current domains
+    const minX = viewDomainX ? viewDomainX[0] : Math.min(...points.map(p => p.t));
+    const maxX = viewDomainX ? viewDomainX[1] : Math.max(...points.map(p => p.t));
+    const minY = viewDomainY ? viewDomainY[0] : Math.min(...points.map(p => p.v));
+    const maxY = viewDomainY ? viewDomainY[1] : Math.max(...points.map(p => p.v));
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const rangeX = (maxX - minX) * factor;
+    const rangeY = (maxY - minY) * factor;
+
+    setViewDomainX([centerX - rangeX / 2, centerX + rangeX / 2]);
+    setViewDomainY([centerY - rangeY / 2, centerY + rangeY / 2]);
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    isDragging.current = true;
+    lastMousePos.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging.current || !lastMousePos.current || !points.length) return;
+
+    const dx = e.clientX - lastMousePos.current.x;
+    const dy = e.clientY - lastMousePos.current.y;
+    lastMousePos.current = { x: e.clientX, y: e.clientY };
+
+    // Approximation of scale - in a real app we'd map pixels to data units
+    // using chart container dimensions, but for UX this feels responsive:
+    const minX = viewDomainX ? viewDomainX[0] : Math.min(...points.map(p => p.t));
+    const maxX = viewDomainX ? viewDomainX[1] : Math.max(...points.map(p => p.t));
+    const minY = viewDomainY ? viewDomainY[0] : Math.min(...points.map(p => p.v));
+    const maxY = viewDomainY ? viewDomainY[1] : Math.max(...points.map(p => p.v));
+
+    const scaleX = (maxX - minX) / 800; // rough width
+    const scaleY = (maxY - minY) / 400; // rough height
+
+    const shiftX = dx * scaleX;
+    const shiftY = dy * scaleY;
+
+    setViewDomainX([minX - shiftX, maxX - shiftX]);
+    setViewDomainY([minY + shiftY, maxY + shiftY]);
+  };
+
+  const handleMouseUp = () => {
+    isDragging.current = false;
+  };
+
   const vMax = points.length ? Math.max(...points.map(p => p.v)) : 0;
   const vMin = points.length ? Math.min(...points.map(p => p.v)) : 0;
   const vAvg = points.length ? (points.reduce((acc, p) => acc + p.v, 0) / points.length) : 0;
   const vPp = vMax - vMin;
 
   return (
-    <div className="flex h-screen bg-zinc-950 overflow-hidden text-zinc-300 font-sans">
-      {/* Mobile Header */}
-      <div className="lg:hidden fixed top-0 left-0 right-0 h-16 bg-zinc-900 border-b border-zinc-800 flex items-center justify-between px-4 z-50">
-        <div className="flex items-center gap-2">
-          <Activity className="text-emerald-500" size={24} />
-          <span className="font-bold tracking-tight text-white">IoT SCOPE</span>
-        </div>
-        <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-zinc-800 rounded-md">
-          {isSidebarOpen ? <X size={24} /> : <Menu size={24} />}
-        </button>
-      </div>
+    <div className="grid lg:grid-cols-[1fr_280px] lg:grid-rows-[60px_1fr_220px] h-screen bg-bg-main p-3 gap-3 overflow-hidden text-text-primary font-sans">
+      
+      {/* Mobile Menu Toggle */}
+      <motion.button 
+        whileHover={{ scale: 1.1 }}
+        whileTap={{ scale: 0.9 }}
+        onClick={() => setIsSidebarOpen(!isSidebarOpen)} 
+        className="lg:hidden fixed top-4 right-4 z-[60] bg-panel p-2 rounded-full border border-border-main"
+      >
+        {isSidebarOpen ? <X size={20} /> : <Menu size={20} />}
+      </motion.button>
 
-      {/* Sidebar / Controls */}
+      {/* Header */}
+      <header className="col-span-full h-full bg-panel border border-border-main rounded-lg flex items-center justify-between px-6">
+        <div className="flex items-center gap-3">
+          <Activity className="text-accent-green glow-green" size={24} />
+          <span className="font-bold tracking-widest text-text-primary text-sm uppercase">IOT.NEXUS / OSCILLOSCOPE</span>
+        </div>
+        
+        <div className="hidden lg:flex items-center gap-8 text-[11px] font-mono text-text-muted">
+          <div className="flex items-center gap-2">
+            <div className="status-dot-active" />
+            <span className="text-accent-green">CONNECTED: RP4-NODE-01</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span>UPTIME: 12h 44m</span>
+          </div>
+          <div className="flex items-center gap-2">
+             <span className="text-accent-blue">SAMPLE RATE: 1.0 MS/s</span>
+          </div>
+          <div className="flex items-center gap-4 ml-4">
+             {user ? (
+               <div className="flex items-center gap-3">
+                  <span className="text-zinc-500">{user.displayName || user.email}</span>
+                  <button onClick={logout} className="hover:text-white transition-colors">
+                    <motion.div whileHover={{ rotate: 15 }} whileTap={{ scale: 0.8 }}>
+                      <LogOut size={14} />
+                    </motion.div>
+                  </button>
+               </div>
+             ) : (
+               <motion.button 
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={loginWithGoogle} 
+                className="text-accent-blue hover:text-white transition-colors font-bold uppercase tracking-tighter"
+               >
+                 Login
+               </motion.button>
+             )}
+          </div>
+          <motion.button 
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => {
+                  if (!isLive) setAiFindings([]);
+                  setIsLive(!isLive);
+                }}
+                className={cn(
+                  "flex items-center gap-2 px-3 py-1 rounded border text-[10px] font-bold uppercase transition-all",
+                  isLive 
+                    ? "bg-red-500/10 border-red-500 text-red-400" 
+                    : "bg-accent-green/10 border-accent-green text-accent-green"
+                )}
+              >
+                {isLive ? <Square size={12} /> : <Play size={12} />}
+                {isLive ? 'Stop' : 'Run'}
+          </motion.button>
+        </div>
+      </header>
+
+      {/* Oscilloscope View */}
+      <main 
+        ref={chartRef}
+        onWheel={handleWheel}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        className="lg:col-start-1 lg:row-start-2 oscilloscope-view relative cursor-crosshair select-none"
+      >
+        <ResponsiveContainer width="100%" height="100%" className="immersive-grid">
+          <LineChart data={points} margin={{ top: 20, right: 20, left: -20, bottom: 20 }}>
+            <CartesianGrid strokeDasharray="0" />
+            <XAxis 
+              dataKey="t" 
+              type="number" 
+              hide={true}
+              domain={viewDomainX || ['auto', 'auto']}
+            />
+            <YAxis 
+              domain={viewDomainY || (isAutoScaling ? ['auto', 'auto'] : [-10, 10])} 
+              tickCount={11}
+            />
+
+            <Tooltip 
+              content={({ active, payload, label }) => {
+                if (active && payload && payload.length && typeof label === 'number') {
+                  const val = payload[0].value as number;
+                  const finding = aiFindings.find(f => label >= f.xStart && label <= f.xEnd);
+                  return (
+                    <div className="bg-panel border border-border-main p-3 rounded-lg shadow-2xl backdrop-blur-md min-w-[200px]">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="text-[10px] font-mono text-text-muted">T: {label.toFixed(4)}s</span>
+                        <span className="text-[10px] font-mono text-accent-blue">V: {val.toFixed(3)}V</span>
+                      </div>
+                      {finding && (
+                        <motion.div 
+                          initial={{ opacity: 0, y: 5 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="mt-2 pt-2 border-t border-border-main"
+                        >
+                          <div className="flex items-center gap-2 mb-1">
+                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: finding.color }} />
+                            <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: finding.color }}>
+                              {finding.label}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-text-muted leading-relaxed italic">
+                            {finding.details}
+                          </p>
+                        </motion.div>
+                      )}
+                    </div>
+                  );
+                }
+                return null;
+              }}
+            />
+            
+            {/* AI Findings Visualization */}
+            {aiFindings.map((finding, idx) => (
+              <ReferenceArea
+                key={idx}
+                x1={finding.xStart}
+                x2={finding.xEnd}
+                fill={finding.color}
+                fillOpacity={0.2}
+                label={{ 
+                  value: finding.label, 
+                  position: 'insideTopLeft', 
+                  fill: finding.color, 
+                  fontSize: 10,
+                  fontWeight: 'bold',
+                  className: 'uppercase font-mono'
+                }}
+                stroke={finding.color}
+                strokeDasharray="3 3"
+              />
+            ))}
+
+            <Line
+              type="monotone"
+              dataKey="v"
+              stroke="var(--color-accent-green)"
+              strokeWidth={2.5}
+              dot={false}
+              isAnimationActive={false}
+              className="glow-green"
+            />
+          </LineChart>
+        </ResponsiveContainer>
+        
+        {/* Overlay Labels */}
+        <div className="absolute top-4 left-6 text-[10px] font-mono text-accent-green/60 uppercase pointer-events-none">
+          CH1: ACTIVE / {isAutoScaling ? 'AUTO' : '1.00V'} DIV
+        </div>
+
+        {/* Zoom Reset Button */}
+        {(viewDomainX || viewDomainY) && (
+          <motion.button
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            onClick={resetView}
+            className="absolute bottom-4 right-6 bg-accent-blue/20 hover:bg-accent-blue/40 border border-accent-blue/50 text-accent-blue text-[9px] font-bold py-1 px-3 rounded-full uppercase tracking-widest backdrop-blur-md"
+          >
+            Reset View
+          </motion.button>
+        )}
+      </main>
+
+      {/* Sidebar */}
       <AnimatePresence>
         {isSidebarOpen && (
           <motion.aside
-            initial={{ x: -300 }}
+            initial={{ x: 300 }}
             animate={{ x: 0 }}
-            exit={{ x: -300 }}
-            className="fixed inset-y-0 left-0 lg:static lg:w-80 bg-zinc-900 border-r border-zinc-800 z-40 overflow-y-auto pt-16 lg:pt-0"
+            exit={{ x: 300 }}
+            className="fixed inset-y-3 right-3 w-80 lg:static lg:w-full lg:row-start-2 lg:row-end-4 flex flex-col gap-3 z-50 h-[calc(100vh-1.5rem)] lg:h-full"
           >
-            <div className="p-6 space-y-8">
-              <div className="hidden lg:flex items-center gap-2 mb-8">
-                <Activity className="text-emerald-500" size={24} />
-                <span className="font-bold tracking-tight text-white text-xl text-nowrap">IoT SCOPE</span>
+            {/* Live Measurements Card */}
+            <div className="panel-card space-y-4">
+              <h3 className="label-muted">Live Measurements</h3>
+              <div className="space-y-3">
+                <MetricRow label="Frequency" value={settings.frequency.toFixed(2)} unit="Hz" />
+                <MetricRow label="Vpp" value={vPp.toFixed(2)} unit="V" />
+                <MetricRow label="Vmax" value={vMax.toFixed(2)} unit="V" />
+                <MetricRow label="Vmin" value={vMin.toFixed(2)} unit="V" />
+                <MetricRow label="Vavg" value={vAvg.toFixed(2)} unit="V" />
               </div>
+            </div>
 
-              {/* Waveform Selector */}
-              <section>
-                <div className="flex items-center gap-2 mb-4">
-                  <Waves size={16} className="text-emerald-400" />
-                  <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500">Waveform Type</h3>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {(['sine', 'square', 'triangle', 'sawtooth'] as WaveformType[]).map((type) => (
-                    <button
-                      key={type}
-                      onClick={() => updateSettings({ type })}
-                      className={cn(
-                        "px-3 py-2 rounded-md border text-sm capitalize transition-all",
-                        settings.type === type 
-                          ? "bg-emerald-500/10 border-emerald-500 text-emerald-400" 
-                          : "bg-zinc-800 border-zinc-700 hover:border-zinc-500"
-                      )}
-                    >
-                      {type}
-                    </button>
-                  ))}
-                </div>
-              </section>
+            {/* Trigger / Settings Card */}
+            <div className="panel-card space-y-4">
+              <h3 className="label-muted">Trigger Settings</h3>
+              <div className="bg-[#331111] text-red-500 text-[9px] font-mono font-bold px-2 py-0.5 rounded inline-block w-fit">
+                AUTO ARM
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                 <div className="flex justify-between border-b border-border-main pb-1">
+                   <span className="text-text-muted text-[10px] uppercase">Source</span>
+                   <span className="text-accent-blue font-mono">CH1</span>
+                 </div>
+                 <div className="flex justify-between border-b border-border-main pb-1">
+                   <span className="text-text-muted text-[10px] uppercase">Level</span>
+                   <span className="text-accent-blue font-mono">0.5V</span>
+                 </div>
+                 <div className="flex justify-between border-b border-border-main pb-1">
+                   <span className="text-text-muted text-[10px] uppercase">Auto-S</span>
+                   <Switch checked={isAutoScaling} onChange={setIsAutoScaling} />
+                 </div>
+                 <div className="flex justify-between border-b border-border-main pb-1">
+                   <span className="text-text-muted text-[10px] uppercase">Live</span>
+                   <Switch 
+                    checked={isLive} 
+                    onChange={(v) => {
+                      if (v) setAiFindings([]);
+                      setIsLive(v);
+                    }} 
+                   />
+                 </div>
+              </div>
+              
+              <div className="pt-2">
+                <motion.button
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={saveSettings}
+                  disabled={isSavingSettings || !user}
+                  className="w-full bg-accent-blue/10 border border-accent-blue/30 text-accent-blue text-[10px] font-bold py-2 rounded uppercase tracking-widest hover:bg-accent-blue/20 transition-all disabled:opacity-50"
+                >
+                  {isSavingSettings ? "Saving Settings..." : "Save Config to Profile"}
+                </motion.button>
+              </div>
+            </div>
 
-              {/* Parameters */}
-              <section className="space-y-6">
-                <div className="flex items-center gap-2 mb-4">
-                  <Settings2 size={16} className="text-blue-400" />
-                  <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500">Parameters</h3>
-                </div>
-                
-                <ControlSlider 
-                  label="Frequency" 
-                  unit="Hz" 
-                  value={settings.frequency} 
-                  min={1} 
-                  max={200} 
-                  onChange={(v) => updateSettings({ frequency: v })} 
-                />
-                <ControlSlider 
-                  label="Amplitude" 
-                  unit="V" 
-                  value={settings.amplitude} 
-                  min={0.1} 
-                  max={2.5} 
-                  step={0.1}
-                  onChange={(v) => updateSettings({ amplitude: v })} 
-                />
-                <ControlSlider 
-                  label="Offset" 
-                  unit="V" 
-                  value={settings.offset} 
-                  min={0} 
-                  max={5} 
-                  step={0.1}
-                  onChange={(v) => updateSettings({ offset: v })} 
-                />
-              </section>
-
-              {/* Display Options */}
-              <section className="space-y-4">
-                 <div className="flex items-center gap-2 mb-4">
-                  <Zap size={16} className="text-amber-400" />
-                  <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500">Display</h3>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm">Auto-scale Y</span>
-                  <Switch checked={isAutoScaling} onChange={setIsAutoScaling} />
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm">Real-time Feed</span>
-                  <button 
-                    onClick={() => setIsLive(!isLive)}
-                    className={cn(
-                      "p-1 rounded-full transition-colors",
-                      isLive ? "text-emerald-500" : "text-zinc-500"
-                    )}
-                  >
-                    {isLive ? <RefreshCw size={20} className="animate-spin" /> : <RefreshCw size={20} />}
-                  </button>
-                </div>
-              </section>
-
-              {/* Actions */}
-              <section className="pt-4 space-y-2">
-                <button 
+            {/* AI Analysis Section */}
+            <div className="panel-card space-y-3 h-full flex flex-col min-h-0 overflow-hidden">
+               <h3 className="label-muted">AI Intelligence</h3>
+               <motion.button 
+                  whileHover={{ scale: 1.01 }}
+                  whileTap={{ scale: 0.98 }}
                   onClick={performAiAnalysis}
                   disabled={isAiAnalyzing}
-                  className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 transition-colors py-2 rounded-md text-sm font-bold text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
-                >
-                  {isAiAnalyzing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-                  AI Analyze Trace
-                </button>
-                <button 
-                  onClick={saveWaveform}
-                  disabled={isSaving || !user}
-                  className="w-full flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 transition-colors py-2 rounded-md text-sm border border-zinc-700"
-                >
-                  {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} 
-                  Save Capture
-                </button>
-                <button 
-                  onClick={exportAsCSV}
-                  className="w-full flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 transition-colors py-2 rounded-md text-sm border border-zinc-700"
-                >
-                  <Download size={16} /> Export CSV
-                </button>
-              </section>
-
-              {/* AI Report Section */}
-              <AnimatePresence>
-                {aiReport && (
-                  <motion.section
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: 'auto', opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    className="overflow-hidden"
-                  >
-                    <div className="p-4 bg-emerald-500/5 border border-emerald-500/20 rounded-lg space-y-2">
-                      <div className="flex items-center justify-between">
-                        <h4 className="text-[10px] font-bold uppercase tracking-wider text-emerald-500">AI Signal Report</h4>
-                        <button onClick={() => setAiReport(null)}><X size={12} className="text-zinc-500" /></button>
-                      </div>
-                      <p className="text-[11px] leading-relaxed text-zinc-400 italic">
-                        {aiReport}
-                      </p>
+                  className="w-full flex items-center justify-center gap-2 bg-accent-blue text-black font-bold uppercase py-2 rounded text-xs transition-opacity disabled:opacity-50"
+               >
+                 {isAiAnalyzing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                 Run Analysis
+               </motion.button>
+               
+               <div className="flex-1 overflow-y-auto pr-1">
+                  {aiReport ? (
+                    <div className="text-[11px] leading-relaxed text-text-muted italic bg-black/20 p-3 rounded border border-border-main">
+                      {aiReport}
                     </div>
-                  </motion.section>
-                )}
-              </AnimatePresence>
+                  ) : (
+                    <div className="h-full flex flex-center text-[10px] text-zinc-600 text-center items-center justify-center px-4">
+                      Run AI Analysis to get insights on the current signal trace from Gemini.
+                    </div>
+                  )}
+               </div>
+            </div>
+
+            {/* Export Card */}
+            <div className="panel-card space-y-3">
+               <h3 className="label-muted">Export Data</h3>
+               <div className="grid grid-cols-2 gap-2">
+                 <motion.button 
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={saveWaveform} 
+                  disabled={isSaving || !user} 
+                  className="bg-zinc-800 text-white text-[10px] py-1.5 rounded border border-border-main hover:bg-zinc-700 transition-colors uppercase font-bold flex items-center justify-center gap-1"
+                 >
+                   {isSaving ? "..." : <Save size={12} />} Save
+                 </motion.button>
+                 <motion.button 
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={exportAsCSV} 
+                  className="bg-accent-green text-black text-[10px] py-1.5 rounded hover:opacity-90 transition-colors uppercase font-bold flex items-center justify-center gap-1"
+                 >
+                   <Download size={12} /> CSV
+                 </motion.button>
+               </div>
+            </div>
+
+            <div className="text-[9px] font-mono text-zinc-600 flex justify-between px-2">
+              <span>IOT.NEXUS FRAMEWORK</span>
+              <span>v2.1.0</span>
             </div>
           </motion.aside>
         )}
       </AnimatePresence>
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0 bg-black">
-        {/* Toolbar */}
-        <header className="h-16 border-b border-zinc-800 flex items-center justify-between px-6 bg-zinc-900/50 backdrop-blur-sm hidden lg:flex">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-xs font-mono uppercase text-emerald-500">Device Connected</span>
-            </div>
-            <div className="h-4 w-[1px] bg-zinc-800" />
-            <span className="text-xs font-mono text-zinc-500">SIMULATED RP4 NODE</span>
+      {/* Controls Footer */}
+      <footer className="lg:col-start-1 lg:row-start-3 bg-panel border border-border-main rounded-lg p-5 grid grid-cols-3 gap-6">
+        
+        {/* Waveform Select */}
+        <div className="space-y-4">
+          <h3 className="label-muted">Waveform Generator</h3>
+          <div className="flex gap-1">
+            {(['sine', 'square', 'triangle', 'sawtooth'] as WaveformType[]).map((type) => (
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                key={type}
+                onClick={() => updateSettings({ type })}
+                className={cn(
+                  "flex-1 p-1.5 text-[9px] font-bold uppercase rounded border transition-all truncate",
+                  settings.type === type 
+                    ? "bg-accent-blue/10 border-accent-blue text-accent-blue" 
+                    : "bg-[#222] border-border-main text-text-muted hover:border-zinc-500"
+                )}
+              >
+                {type}
+              </motion.button>
+            ))}
           </div>
-          
-          <div className="flex items-center gap-3">
-             {user ? (
-               <div className="flex items-center gap-4">
-                 <div className="flex items-center gap-2 bg-zinc-800 px-3 py-1.5 rounded-full border border-zinc-700">
-                    {user.photoURL ? (
-                      <img src={user.photoURL} alt="User" className="w-5 h-5 rounded-full" referrerPolicy="no-referrer" />
-                    ) : (
-                      <UserIcon size={14} className="text-zinc-400" />
-                    )}
-                    <span className="text-xs font-medium text-zinc-300">{user.displayName || user.email}</span>
-                 </div>
-                 <button 
-                  onClick={logout}
-                  className="p-2 hover:bg-zinc-800 rounded-md text-zinc-400 hover:text-white transition-colors"
-                  title="Logout"
-                >
-                  <LogOut size={18} />
-                </button>
-               </div>
-             ) : (
-               <button 
-                onClick={loginWithGoogle}
-                disabled={isAuthLoading}
-                className="flex items-center gap-2 px-4 py-1.5 bg-zinc-100 text-zinc-950 rounded-md text-xs font-bold hover:bg-white transition-all disabled:opacity-50"
-               >
-                 <LogIn size={14} /> Login with Google
-               </button>
-             )}
-             
-             <div className="h-4 w-[1px] bg-zinc-800 mx-1" />
-
-             <button 
-              onClick={() => setIsLive(!isLive)}
-              className={cn(
-                "flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-all border",
-                isLive 
-                  ? "bg-red-500/10 border-red-500 text-red-400" 
-                  : "bg-emerald-500/10 border-emerald-500 text-emerald-400"
-              )}
-            >
-              {isLive ? <><Square size={14} /> STOP</> : <><Play size={14} /> RESUME</>}
-            </button>
-          </div>
-        </header>
-
-        {/* Dashboard Content */}
-        <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-6 pt-20 lg:pt-8">
-          
-          {/* Main Oscilloscope Card */}
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-            <div className="lg:col-span-3 bg-zinc-900/40 border border-zinc-800 rounded-xl p-6 relative overflow-hidden group">
-              <div className="absolute top-0 left-0 w-1 h-full bg-emerald-500 opacity-50" />
-              <div className="flex items-center justify-between mb-8">
-                <h2 className="text-sm font-bold uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                  <Activity size={18} className="text-emerald-500" />
-                  Live Trace
-                </h2>
-                <div className="flex gap-4 text-xs font-mono">
-                   <div className="flex flex-col">
-                    <span className="text-zinc-500 text-[10px] uppercase">Sampling</span>
-                    <span className="text-zinc-100">500 Sa/s</span>
-                  </div>
-                   <div className="flex flex-col">
-                    <span className="text-zinc-500 text-[10px] uppercase">Resolution</span>
-                    <span className="text-zinc-100">12-bit</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Chart Container */}
-              <div className="h-[400px] w-full oscilloscope-grid">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={points} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={true} />
-                    <XAxis 
-                      dataKey="t" 
-                      type="number" 
-                      domain={['auto', 'auto']} 
-                      hide
-                    />
-                    <YAxis 
-                      type="number" 
-                      domain={isAutoScaling ? ['auto', 'auto'] : [0, 5]}
-                      ticks={[0, 1, 2, 3, 4, 5]}
-                    />
-                    <ReferenceLine y={2.5} stroke="#525252" strokeDasharray="3 3" />
-                    <Line 
-                      type="monotone" 
-                      dataKey="v" 
-                      stroke="#10b981" 
-                      strokeWidth={2} 
-                      dot={false}
-                      isAnimationActive={false}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            {/* Sidebar Stats */}
-            <div className="space-y-4">
-              <StatCard label="V peak-peak" value={vPp.toFixed(2)} unit="V" icon={<Zap className="text-amber-400" size={16} />} />
-              <StatCard label="V average" value={vAvg.toFixed(2)} unit="V" icon={<Activity className="text-blue-400" size={16} />} />
-              <StatCard label="V max" value={vMax.toFixed(2)} unit="V" className="border-emerald-500/20" />
-              <StatCard label="V min" value={vMin.toFixed(2)} unit="V" className="border-red-500/20" />
-            </div>
-          </div>
-
-          {/* Device Logs / Alerts */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div className="bg-zinc-900/40 border border-zinc-800 rounded-xl p-6">
-              <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4 flex items-center gap-2">
-                <AlertCircle size={16} className="text-amber-500" />
-                Connectivity Status
-              </h3>
-              <div className="space-y-3">
-                 <div className="flex items-center justify-between text-sm py-2 border-b border-zinc-800">
-                  <span className="text-zinc-400">Node Status</span>
-                  <span className="text-emerald-400 flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_#10b981]" /> ONLINE</span>
-                </div>
-                 <div className="flex items-center justify-between text-sm py-2 border-b border-zinc-800">
-                  <span className="text-zinc-400">Latency</span>
-                  <span className="text-zinc-100 font-mono">14ms</span>
-                </div>
-                 <div className="flex items-center justify-between text-sm py-2">
-                  <span className="text-zinc-400">Uptime</span>
-                  <span className="text-zinc-100 font-mono">12h 43m</span>
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-zinc-900/40 border border-zinc-800 rounded-xl p-6 relative overflow-hidden">
-               <div className="absolute top-0 right-0 p-3">
-                <Waves className="text-zinc-800" size={48} />
-               </div>
-               <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Signal Metadata</h3>
-               <div className="grid grid-cols-2 gap-4">
-                  <div className="p-3 bg-zinc-950/50 rounded-lg border border-zinc-800">
-                    <span className="block text-[10px] uppercase text-zinc-500 mb-1">Frequency</span>
-                    <span className="text-lg font-mono text-zinc-100">{settings.frequency} Hz</span>
-                  </div>
-                  <div className="p-3 bg-zinc-950/50 rounded-lg border border-zinc-800">
-                    <span className="block text-[10px] uppercase text-zinc-500 mb-1">Load Status</span>
-                    <span className="text-lg font-mono text-emerald-400">NOMINAL</span>
-                  </div>
-               </div>
-            </div>
+          <div className="flex justify-around items-center pt-2">
+            <DialKnob label="Freq" value={(settings.frequency / 200) * 270} />
+            <DialKnob label="Amp" value={(settings.amplitude / 2.5) * 270} />
+            <DialKnob label="Offset" value={(settings.offset / 5) * 270} />
           </div>
         </div>
-      </main>
+
+        {/* Time Parameters */}
+        <div className="border-l border-border-main pl-6 space-y-6">
+          <h3 className="label-muted">Horizontal (Time)</h3>
+          <ControlSlider 
+            label="Frequency" 
+            unit="Hz" 
+            value={settings.frequency} 
+            min={1} 
+            max={200} 
+            onChange={(v) => updateSettings({ frequency: v })} 
+          />
+          <div className="text-[11px] font-mono text-text-muted text-center pt-2">
+            TIMEBASE: 5.00 ms/DIV
+          </div>
+        </div>
+
+        {/* Amplitude Parameters */}
+        <div className="border-l border-border-main pl-6 space-y-6">
+          <h3 className="label-muted">Vertical (Volts)</h3>
+          <ControlSlider 
+            label="Amplitude" 
+            unit="V" 
+            value={settings.amplitude} 
+            min={0.1} 
+            max={2.5} 
+            step={0.1}
+            onChange={(v) => updateSettings({ amplitude: v })} 
+          />
+          <ControlSlider 
+            label="Offset" 
+            unit="V" 
+            value={settings.offset} 
+            min={0} 
+            max={5} 
+            step={0.1}
+            onChange={(v) => updateSettings({ offset: v })} 
+          />
+        </div>
+
+      </footer>
 
       {/* Floating Alerts */}
-      <div className="fixed bottom-6 right-6 z-50 space-y-2 pointer-events-none">
+      <div className="fixed bottom-6 right-6 z-[70] space-y-2 pointer-events-none">
         <AnimatePresence>
           {alerts.map((alert) => (
             <motion.div
@@ -576,14 +753,52 @@ export default function App() {
 
 // Subcomponents
 
+function MetricRow({ label, value, unit }: { label: string, value: string, unit: string }) {
+  return (
+    <div className="flex justify-between items-baseline border-b border-border-main pb-1">
+      <span className="text-[10px] text-text-muted uppercase tracking-tighter">{label}</span>
+      <div className="flex items-baseline gap-1">
+        <span className="metric-v">{value}</span>
+        <span className="text-[9px] text-accent-blue/60 font-mono uppercase">{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function DialKnob({ label, value }: { label: string, value: number }) {
+  return (
+    <motion.div 
+      whileHover={{ scale: 1.1 }}
+      className="flex flex-col items-center gap-1.5 cursor-pointer"
+    >
+      <div className="relative group">
+        <motion.div 
+          className="dial-knob"
+          animate={{ rotate: value }}
+          transition={{ type: "spring", stiffness: 300, damping: 20 }}
+          style={{ '--rotation': `${value}deg` } as any}
+        />
+        <div className="absolute inset-0 bg-accent-blue/0 group-hover:bg-accent-blue/5 rounded-full transition-colors" />
+      </div>
+      <span className="text-[9px] font-bold uppercase text-text-muted">{label}</span>
+    </motion.div>
+  );
+}
+
 function ControlSlider({ label, value, min, max, unit, step = 1, onChange }: { 
-  label: string, value: number, min: number, max: number, unit: string, step?: number, onChange: (v: number) => void 
+  label: string, 
+  value: number, 
+  min: number, 
+  max: number, 
+  unit: string, 
+  step?: number,
+  onChange: (v: number) => void 
 }) {
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between text-xs">
-        <span className="text-zinc-400 uppercase tracking-wide">{label}</span>
-        <span className="font-mono text-zinc-100">{value.toFixed(step < 1 ? 1 : 0)}{unit}</span>
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-text-muted uppercase tracking-wide">{label}</span>
+        <span className="font-mono text-accent-blue">{value.toFixed(step < 1 ? 1 : 0)}{unit}</span>
       </div>
       <input 
         type="range" 
@@ -592,42 +807,27 @@ function ControlSlider({ label, value, min, max, unit, step = 1, onChange }: {
         step={step}
         value={value} 
         onChange={(e) => onChange(parseFloat(e.target.value))}
-        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+        className="w-full h-1 bg-[#2a2a2a] rounded-full appearance-none cursor-pointer accent-accent-blue"
       />
-    </div>
-  );
-}
-
-function StatCard({ label, value, unit, icon, className }: { label: string, value: string, unit: string, icon?: React.ReactNode, className?: string }) {
-  return (
-    <div className={cn("bg-zinc-900/60 border border-zinc-800 p-4 rounded-xl flex items-center justify-between", className)}>
-      <div>
-        <p className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-1">{label}</p>
-        <div className="flex items-end gap-1">
-          <span className="text-xl font-mono text-zinc-100 leading-none">{value}</span>
-          <span className="text-[10px] font-medium text-zinc-500 pb-0.5">{unit}</span>
-        </div>
-      </div>
-      {icon}
     </div>
   );
 }
 
 function Switch({ checked, onChange }: { checked: boolean, onChange: (v: boolean) => void }) {
   return (
-    <button 
+    <motion.button 
+      whileTap={{ scale: 0.9 }}
       onClick={() => onChange(!checked)}
       className={cn(
-        "relative inline-flex h-5 w-10 items-center rounded-full transition-colors focus:outline-none",
-        checked ? "bg-emerald-500" : "bg-zinc-700"
+        "relative inline-flex h-3.5 w-7 items-center rounded-full transition-colors focus:outline-none",
+        checked ? "bg-accent-green glow-green" : "bg-zinc-800"
       )}
     >
-      <span
-        className={cn(
-          "inline-block h-3 w-3 transform rounded-full bg-white transition-transform",
-          checked ? "translate-x-6" : "translate-x-1"
-        )}
+      <motion.span
+        animate={{ x: checked ? 16 : 4 }}
+        transition={{ type: "spring", stiffness: 500, damping: 30 }}
+        className="inline-block h-2 w-2 transform rounded-full bg-white"
       />
-    </button>
+    </motion.button>
   );
 }

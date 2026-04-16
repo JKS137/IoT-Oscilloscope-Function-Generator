@@ -4,28 +4,77 @@
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg-main: #0a0a0c;
+  --color-panel: #16161d;
+  --color-accent-green: #00ff9d;
+  --color-accent-blue: #00d4ff;
+  --color-text-primary: #e0e0e0;
+  --color-text-muted: #80808a;
+  --color-border-main: #2d2d3a;
+  --color-grid: rgba(0, 255, 157, 0.1);
 }
 
 @layer base {
   body {
-    @apply bg-zinc-950 text-zinc-100 font-sans antialiased;
+    @apply bg-bg-main text-text-primary font-sans antialiased;
   }
 }
 
-.oscilloscope-grid .recharts-cartesian-grid-horizontal line,
-.oscilloscope-grid .recharts-cartesian-grid-vertical line {
-  stroke: rgba(255, 255, 255, 0.1);
+.oscilloscope-view {
+  @apply relative overflow-hidden bg-black border-2 border-border-main rounded-lg;
+  background-image: linear-gradient(var(--color-grid) 1px, transparent 1px), 
+                    linear-gradient(90deg, var(--color-grid) 1px, transparent 1px);
+  background-size: 50px 50px;
 }
 
-.oscilloscope-grid .recharts-cartesian-axis-line {
-  stroke: rgba(255, 255, 255, 0.3);
+.panel-card {
+  @apply bg-panel border border-border-main rounded-lg p-4;
 }
 
-.oscilloscope-grid .recharts-cartesian-axis-tick-line {
-  stroke: rgba(255, 255, 255, 0.3);
+.metric-v {
+  @apply font-mono text-accent-blue;
 }
 
-.oscilloscope-grid .recharts-text {
-  @apply fill-zinc-500 font-mono text-[10px];
+.label-muted {
+  @apply text-xs uppercase font-bold tracking-wider text-text-muted;
+}
+
+.glow-green {
+  filter: drop-shadow(0 0 4px var(--color-accent-green));
+}
+
+.glow-blue {
+  filter: drop-shadow(0 0 4px var(--color-accent-blue));
+}
+
+.status-dot-active {
+  @apply w-2 h-2 rounded-full bg-accent-green shadow-[0_0_8px_#00ff9d];
+}
+
+/* Custom Knob Styling */
+.dial-knob {
+  @apply w-12 h-12 rounded-full border-2 border-[#333] mb-2 relative;
+  background: radial-gradient(circle at 30% 30%, #444, #111);
+}
+
+.dial-knob::after {
+  content: '';
+  @apply absolute top-2 left-1/2 w-0.5 h-3 bg-accent-blue -translate-x-1/2 origin-[center_10px];
+}
+
+/* Recharts Overrides for Immersive Theme */
+.immersive-grid .recharts-cartesian-grid-horizontal line,
+.immersive-grid .recharts-cartesian-grid-vertical line {
+  stroke: var(--color-grid);
+}
+
+.immersive-grid .recharts-cartesian-axis-line,
+.immersive-grid .recharts-cartesian-axis-tick-line {
+  stroke: rgba(255, 255, 255, 0.15);
+}
+
+.immersive-grid .recharts-text {
+  @apply fill-text-muted font-mono text-[9px];
 }
 
